@@ -1,0 +1,4 @@
+{
+    "required": ".github/policies/required-files.txt",
+    "banned": ".github/policies/banned-files.txt"
+}
