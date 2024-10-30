@@ -36,6 +36,8 @@ jobs:
       run: |
         echo "Username length: ${#ACR_USERNAME}"
         echo "Password length: ${#ACR_PASSWORD}"
+        echo "First 3 letters of username: ${ACR_USERNAME:0:3}"
+        echo "First 3 letters of password: ${ACR_PASSWORD:0:3}"
       env:
         ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
         ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
