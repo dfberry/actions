@@ -22,29 +22,29 @@ jobs:
       run: ls
 
 
-    # - name: Set up Docker Buildx
-    #   uses: docker/setup-buildx-action@v1
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
 
-    # - name: Log in to Azure Container Registry
-    #   uses: azure/docker-login@v1
-    #   with:
-    #     login-server: ${{ secrets.ACR_LOGIN_SERVER }}
-    #     username: ${{ secrets.ACR_USERNAME }}
-    #     password: ${{ secrets.ACR_PASSWORD }}
+    - name: Log in to Azure Container Registry
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+        username: ${{ secrets.ACR_USERNAME }}
+        password: ${{ secrets.ACR_PASSWORD }}
 
-    # - name: Build and push Docker image
-    #   run: |
-    #     docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/my-container-app:latest .
-    #     docker push ${{ secrets.ACR_LOGIN_SERVER }}/my-container-app:latest
+    - name: Build and push Docker image
+      run: |
+        docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/my-container-app:latest .
+        docker push ${{ secrets.ACR_LOGIN_SERVER }}/my-container-app:latest
 
-    # - name: Azure Login
-    #   uses: azure/login@v1
-    #   with:
-    #     creds: ${{ secrets.AZURE_CREDENTIALS }}
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-    # - name: Deploy to Azure Container Apps
-    #   run: |
-    #     az containerapp update \
-    #       --name my-container-app \
-    #       --resource-group my-resource-group \
-    #       --image ${{ secrets.ACR_LOGIN_SERVER }}/my-container-app:latest
+    - name: Deploy to Azure Container Apps
+      run: |
+        az containerapp update \
+          --name my-container-app \
+          --resource-group my-resource-group \
+          --image ${{ secrets.ACR_LOGIN_SERVER }}/my-container-app:latest
