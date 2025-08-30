@@ -103,9 +103,10 @@ jobs:
           B64_LEN=$(echo -n "$B64" | wc -c || true)
           MAX_OUTPUT_LEN=30000
           if [ -n "$B64" ] && [ "$B64_LEN" -le "$MAX_OUTPUT_LEN" ]; then
+            # Use the recommended GITHUB_OUTPUT multiline format: key<<EOF / EOF on its own line
             echo "analysis_b64<<EOF" >> "$GITHUB_OUTPUT"
-            echo -n "$B64" >> "$GITHUB_OUTPUT"
-            echo "\nEOF" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$B64" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
           else
             # too large to include in workflow outputs
             echo "analysis_b64=" >> "$GITHUB_OUTPUT"
