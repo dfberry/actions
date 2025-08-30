@@ -86,8 +86,7 @@ jobs:
           docker run --rm "${DOCKER_ENV_ARGS[@]}" gcr.io/openssf/scorecard:stable --format=json ${CHECKS_ARG} --repo="$REPO_ARG" > "$RESULT_FILE"
 
           # Prepare artifact name
-          SAFE_REPO_NAME=$(echo "$REPO_INPUT" | sed 's#[/:]#-#g')
-          ARTIFACT_NAME="ossf-scorecard-${SAFE_REPO_NAME}"
+          ARTIFACT_NAME="ossf-scorecard"
 
           # Compute aggregate score (try jq; install if necessary)
           AGG_SCORE=""
@@ -149,21 +148,8 @@ jobs:
             echo "warning: artifact not found in run artifacts" >&2
           fi
 
-      - name: Upload Scorecard metadata artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.run-score.outputs.artifact_name }}-metadata
-          path: ossf-scorecard-output/artifact_download_url.txt
-
       - name: Show short summary
         run: |
           echo "Artifact: ${{ steps.run-score.outputs.artifact_name }}"
-          echo "Aggregate score: ${{ steps.run-score.outputs.aggregate_score }}"
           echo "Artifact URL: ${{ steps.get-artifact-url.outputs.download_url }}"
-
-      - name: Output (debug)
-        if: ${{ always() }}
-        run: |
-          echo "--- Scorecard output (first 400 chars) ---"
-          head -c 400 "${{ steps.run-score.outputs.result_file }}" || true
-          echo
+          echo "Aggregate score: ${{ steps.run-score.outputs.aggregate_score }}"
