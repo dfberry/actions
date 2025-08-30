@@ -1,0 +1,136 @@
+# OSSF Scorecard Analysis workflow
+# - Trigger: workflow_dispatch with input "repo" (owner/repo or full URL) and optional "checks".
+# - Runs the OpenSSF Scorecard Docker image (gcr.io/openssf/scorecard:stable) on an Ubuntu runner.
+# - Produces a JSON result at ossf-scorecard-output/scorecard.json and uploads it as an artifact.
+# - Job outputs: artifact_name, aggregate_score, analysis_b64 (base64 JSON if small enough; analysis_truncated=true otherwise).
+# - How to run: from the Actions tab, start the workflow and provide repo = owner/repo (or full GitHub URL).
+# - For higher rate limits or private repos, set repository secret SCORECARD_TOKEN (falls back to GITHUB_TOKEN).
+
+name: OSSF Scorecard Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Repository to analyze (owner/repo or full URL)'
+        required: true
+        default: ''
+      checks:
+        description: 'Comma-separated checks to run (optional)'
+        required: false
+        default: ''
+
+# read access is required for retrieving repository metadata if using the default GITHUB_TOKEN
+permissions:
+  contents: read
+
+jobs:
+  ossf-scorecard:
+    name: Run OSSF Scorecard
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.run-score.outputs.artifact_name }}
+      aggregate_score: ${{ steps.run-score.outputs.aggregate_score }}
+      analysis_b64: ${{ steps.run-score.outputs.analysis_b64 }}
+
+    steps:
+      - name: Run Scorecard (Docker)
+        id: run-score
+        # shell step runs on the runner and will pull the Scorecard Docker image
+        run: |
+          set -euo pipefail
+
+          # Input repository (owner/repo or full URL)
+          REPO_INPUT="${{ github.event.inputs.repo }}"
+          if [ -z "$REPO_INPUT" ] || [ "$REPO_INPUT" = "null" ]; then
+            echo "No repository supplied (workflow input 'repo' is required)." >&2
+            exit 1
+          fi
+
+          # Normalize the repo argument for scorecard (--repo accepts e.g. github.com/owner/repo or a full URL)
+          if echo "$REPO_INPUT" | grep -E '^https?://' >/dev/null 2>&1; then
+            REPO_ARG="$REPO_INPUT"
+          elif echo "$REPO_INPUT" | grep -E '^[^/]+/[^/]+$' >/dev/null 2>&1; then
+            REPO_ARG="https://github.com/$REPO_INPUT"
+          else
+            echo "Repo input must be 'owner/repo' or a full URL" >&2
+            exit 1
+          fi
+
+          # Prefer a repo-scoped secret SCORECARD_TOKEN if provided; otherwise fall back to GITHUB_TOKEN
+          TOKEN="${{ secrets.SCORECARD_TOKEN }}"
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+
+          # Prepare output directory and file
+          OUT_DIR="${{ github.workspace }}/ossf-scorecard-output"
+          mkdir -p "$OUT_DIR"
+          RESULT_FILE="$OUT_DIR/scorecard.json"
+
+          # Optional: allow caller to provide which checks to run
+          CHECKS_INPUT="${{ github.event.inputs.checks }}"
+          CHECKS_ARG=""
+          if [ -n "$CHECKS_INPUT" ] && [ "$CHECKS_INPUT" != "null" ]; then
+            CHECKS_ARG="--checks=${CHECKS_INPUT}"
+          fi
+
+          # Pull and run the official Scorecard container. If a token is available, pass it to avoid rate limits.
+          DOCKER_ENV_ARGS=()
+          if [ -n "$TOKEN" ]; then
+            DOCKER_ENV_ARGS+=( -e GITHUB_AUTH_TOKEN="$TOKEN" )
+          fi
+
+          echo "Running Scorecard against: $REPO_ARG"
+          docker run --rm "${DOCKER_ENV_ARGS[@]}" gcr.io/openssf/scorecard:stable --format=json ${CHECKS_ARG} --repo="$REPO_ARG" > "$RESULT_FILE"
+
+          # Prepare artifact name
+          SAFE_REPO_NAME=$(echo "$REPO_INPUT" | sed 's#[/:]#-#g')
+          ARTIFACT_NAME="ossf-scorecard-${SAFE_REPO_NAME}"
+
+          # Compute aggregate score (try jq; install if necessary)
+          AGG_SCORE=""
+          if command -v jq >/dev/null 2>&1; then
+            AGG_SCORE=$(jq -r '.summary.score // .score // ""' "$RESULT_FILE" || true)
+          else
+            # install jq briefly
+            sudo apt-get update && sudo apt-get install -y jq
+            AGG_SCORE=$(jq -r '.summary.score // .score // ""' "$RESULT_FILE" || true)
+          fi
+
+          # Base64-encode JSON and set as output only if small enough (avoid exceeding GitHub output size limits)
+          B64=$(base64 --wrap=0 "$RESULT_FILE" || base64 "$RESULT_FILE") || true
+          B64_LEN=$(echo -n "$B64" | wc -c || true)
+          MAX_OUTPUT_LEN=30000
+          if [ -n "$B64" ] && [ "$B64_LEN" -le "$MAX_OUTPUT_LEN" ]; then
+            echo "analysis_b64<<EOF" >> "$GITHUB_OUTPUT"
+            echo -n "$B64" >> "$GITHUB_OUTPUT"
+            echo "\nEOF" >> "$GITHUB_OUTPUT"
+          else
+            # too large to include in workflow outputs
+            echo "analysis_b64=" >> "$GITHUB_OUTPUT"
+            echo "analysis_truncated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Export smaller outputs
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "aggregate_score=$AGG_SCORE" >> "$GITHUB_OUTPUT"
+          echo "result_file=$RESULT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Scorecard result as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.run-score.outputs.artifact_name }}
+          path: ${{ steps.run-score.outputs.result_file }}
+
+      - name: Show short summary
+        run: |
+          echo "Artifact: ${{ steps.run-score.outputs.artifact_name }}"
+          echo "Aggregate score: ${{ steps.run-score.outputs.aggregate_score }}"
+
+      - name: Output (debug)
+        if: ${{ always() }}
+        run: |
+          echo "--- Scorecard output (first 400 chars) ---"
+          head -c 400 "${{ steps.run-score.outputs.result_file }}" || true
+          echo
