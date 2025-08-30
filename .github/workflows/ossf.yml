@@ -32,6 +32,7 @@ jobs:
       artifact_name: ${{ steps.run-score.outputs.artifact_name }}
       aggregate_score: ${{ steps.run-score.outputs.aggregate_score }}
       analysis_b64: ${{ steps.run-score.outputs.analysis_b64 }}
+      artifact_download_url: ${{ steps.get-artifact-url.outputs.download_url }}
 
     steps:
       - name: Run Scorecard (Docker)
@@ -124,10 +125,41 @@ jobs:
           name: ${{ steps.run-score.outputs.artifact_name }}
           path: ${{ steps.run-score.outputs.result_file }}
 
+      - name: Get artifact download URL
+        id: get-artifact-url
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Ensure jq and curl are available
+          sudo apt-get update && sudo apt-get install -y jq curl
+
+          ARTIFACT_NAME="${{ steps.run-score.outputs.artifact_name }}"
+          echo "Looking up artifact named: $ARTIFACT_NAME"
+
+          RESP=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts")
+          DOWNLOAD_URL=$(echo "$RESP" | jq -r --arg name "$ARTIFACT_NAME" '.artifacts[] | select(.name==$name) | .archive_download_url' | head -n1)
+
+          if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
+            echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+            mkdir -p ossf-scorecard-output
+            echo "$DOWNLOAD_URL" > ossf-scorecard-output/artifact_download_url.txt
+          else
+            echo "download_url=" >> $GITHUB_OUTPUT
+            echo "warning: artifact not found in run artifacts" >&2
+          fi
+
+      - name: Upload Scorecard metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.run-score.outputs.artifact_name }}-metadata
+          path: ossf-scorecard-output/artifact_download_url.txt
+
       - name: Show short summary
         run: |
           echo "Artifact: ${{ steps.run-score.outputs.artifact_name }}"
           echo "Aggregate score: ${{ steps.run-score.outputs.aggregate_score }}"
+          echo "Artifact URL: ${{ steps.get-artifact-url.outputs.download_url }}"
 
       - name: Output (debug)
         if: ${{ always() }}
