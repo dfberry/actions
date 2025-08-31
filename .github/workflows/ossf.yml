@@ -148,6 +148,9 @@ jobs:
           echo "aggregate_score=$AGG_SCORE" >> "$GITHUB_OUTPUT"
           echo "result_file=$RESULT_FILE" >> "$GITHUB_OUTPUT"
 
+          # Add the Score to the step summary
+          echo "$REPO_INPUT score: $AGG_SCORE" >> $GITHUB_STEP_SUMMARY
+
       - name: Upload Scorecard result as artifact
         uses: actions/upload-artifact@v4
         with:
