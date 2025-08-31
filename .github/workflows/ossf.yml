@@ -62,6 +62,9 @@ jobs:
           echo "Workflow run ID: $ID"
           echo "Artifact name: $ARTIFACT_NAME"
 
+          # Add the ID to the step summary
+          echo "Workflow run INPUT_GUID_ID: $ID" >> $GITHUB_STEP_SUMMARY
+
       - name: Run Scorecard (Docker)
         id: run-score
         # shell step runs on the runner and will pull the Scorecard Docker image
