@@ -33,7 +33,7 @@ jobs:
     name: Run OSSF Scorecard
     runs-on: ubuntu-latest
     outputs:
-      artifact_name: ${{ steps.run-score.outputs.artifact_name }}
+      artifact_name: ${{ steps.set-id.outputs.artifact_name }}
       aggregate_score: ${{ steps.run-score.outputs.aggregate_score }}
       analysis_b64: ${{ steps.run-score.outputs.analysis_b64 }}
       artifact_download_url: ${{ steps.get-artifact-url.outputs.download_url }}
@@ -55,8 +55,12 @@ jobs:
             ID="${{ github.event.inputs.id }}"
           fi
 
+          ARTIFACT_NAME="ossf-scorecard_${ID}"
+
           echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
           echo "Workflow run ID: $ID"
+          echo "Artifact name: $ARTIFACT_NAME"
 
       - name: Run Scorecard (Docker)
         id: run-score
@@ -109,7 +113,7 @@ jobs:
           docker run --rm "${DOCKER_ENV_ARGS[@]}" gcr.io/openssf/scorecard:stable --format=json ${CHECKS_ARG} --repo="$REPO_ARG" > "$RESULT_FILE"
 
           # Prepare artifact name
-          ARTIFACT_NAME="ossf-scorecard"
+          ARTIFACT_NAME="${{ steps.set-id.outputs.artifact_name }}"
 
           # Compute aggregate score (try jq; install if necessary)
           AGG_SCORE=""
