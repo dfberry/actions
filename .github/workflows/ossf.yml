@@ -15,6 +15,10 @@ on:
         description: 'Repository to analyze (owner/repo or full URL)'
         required: true
         default: ''
+      id: 
+        description: 'Unique identifier for the workflow run (for tracking purposes)'
+        required: true
+        default: ''
       checks:
         description: 'Comma-separated checks to run (optional)'
         required: false
@@ -35,6 +39,25 @@ jobs:
       artifact_download_url: ${{ steps.get-artifact-url.outputs.download_url }}
 
     steps:
+
+      - name: Set workflow run ID
+        id: set-id
+        run: |
+          # If the 'id' input is empty or an empty string, set it to a unique GUID
+          if [ -z "${{ github.event.inputs.id }}" ] || [ "${{ github.event.inputs.id }}" = "null" ]; then
+            # Generate a GUID (UUID v4)
+            if command -v uuidgen >/dev/null 2>&1; then
+              ID=$(uuidgen)
+            else
+              ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || (head -c16 /dev/urandom | xxd -p | sed 's/\(..\)/\1-/g; s/-$//'))
+            fi
+          else
+            ID="${{ github.event.inputs.id }}"
+          fi
+
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Workflow run ID: $ID"
+
       - name: Run Scorecard (Docker)
         id: run-score
         # shell step runs on the runner and will pull the Scorecard Docker image
@@ -67,7 +90,7 @@ jobs:
           # Prepare output directory and file
           OUT_DIR="${{ github.workspace }}/ossf-scorecard-output"
           mkdir -p "$OUT_DIR"
-          RESULT_FILE="$OUT_DIR/scorecard.json"
+          RESULT_FILE="$OUT_DIR/scorecard_${{ steps.set-id.outputs.id }}.json"
 
           # Optional: allow caller to provide which checks to run
           CHECKS_INPUT="${{ github.event.inputs.checks }}"
@@ -150,6 +173,8 @@ jobs:
 
       - name: Show short summary
         run: |
+          echo "Workflow input run: ${{ steps.set-id.outputs.id }}"
           echo "Artifact: ${{ steps.run-score.outputs.artifact_name }}"
           echo "Artifact URL: ${{ steps.get-artifact-url.outputs.download_url }}"
+          echo "Scorecard FileName: ${{ steps.run-score.outputs.result_file}}"
           echo "Aggregate score: ${{ steps.run-score.outputs.aggregate_score }}"
