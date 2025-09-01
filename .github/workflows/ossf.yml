@@ -65,6 +65,31 @@ jobs:
           # Add the ID to the step summary
           echo "Workflow run INPUT_GUID_ID: $ID" >> $GITHUB_STEP_SUMMARY
 
+      - name: Restore Scorecard image cache
+        id: cache-scorecard-image
+        uses: actions/cache@v4
+        with:
+          path: scorecard_image.tar
+          key: scorecard-image-${{ runner.os }}-gcr-ossf-scorecard-stable
+
+      - name: Load cached Scorecard image
+        if: steps.cache-scorecard-image.outputs.cache-hit == 'true'
+        run: |
+          if [ -f scorecard_image.tar ]; then
+            echo "Loading cached Scorecard image..."
+            docker load -i scorecard_image.tar || true
+          else
+            echo "Cache indicated hit but tarball missing; proceeding to pull image."
+          fi
+
+      - name: Pull and save Scorecard image (cache miss)
+        if: steps.cache-scorecard-image.outputs.cache-hit != 'true'
+        run: |
+          echo "Pulling Scorecard image from registry..."
+          docker pull gcr.io/openssf/scorecard:stable
+          echo "Saving Scorecard image to tar for caching..."
+          docker save gcr.io/openssf/scorecard:stable -o scorecard_image.tar
+
       - name: Run Scorecard (Docker)
         id: run-score
         # shell step runs on the runner and will pull the Scorecard Docker image
@@ -113,32 +138,57 @@ jobs:
           fi
 
           echo "Running Scorecard against: $REPO_ARG"
-          docker run --rm "${DOCKER_ENV_ARGS[@]}" gcr.io/openssf/scorecard:stable --format=json ${CHECKS_ARG} --repo="$REPO_ARG" > "$RESULT_FILE"
+          # Capture stdout and stderr so we can detect and record non-JSON output
+          STDERR_FILE="$OUT_DIR/scorecard_${{ steps.set-id.outputs.id }}.stderr.log"
+          RESULT_LOG="$OUT_DIR/scorecard_${{ steps.set-id.outputs.id }}.log"
+          # Run docker and capture exit code separately so we can log it
+          docker run --rm "${DOCKER_ENV_ARGS[@]}" gcr.io/openssf/scorecard:stable --format=json ${CHECKS_ARG} --repo="$REPO_ARG" > "$RESULT_FILE" 2>"$STDERR_FILE"
+          DOCKER_EXIT_CODE=$?
+
+          # Write header with timestamp and exit status to the consolidated log
+          echo "Timestamp: $(date --utc +%Y-%m-%dT%H:%M:%SZ)" > "$RESULT_LOG" || true
+          echo "Docker exit code: ${DOCKER_EXIT_CODE}" >> "$RESULT_LOG" || true
 
           # Prepare artifact name
           ARTIFACT_NAME="${{ steps.set-id.outputs.artifact_name }}"
 
-          # Compute aggregate score (try jq; install if necessary)
-          AGG_SCORE=""
+          # Validate JSON before parsing; install jq if needed
+          IS_JSON=false
           if command -v jq >/dev/null 2>&1; then
-            AGG_SCORE=$(jq -r '.summary.score // .score // ""' "$RESULT_FILE" || true)
+            if jq -e . "$RESULT_FILE" >/dev/null 2>&1; then
+              IS_JSON=true
+            fi
           else
-            # install jq briefly
             sudo apt-get update && sudo apt-get install -y jq
-            AGG_SCORE=$(jq -r '.summary.score // .score // ""' "$RESULT_FILE" || true)
+            if jq -e . "$RESULT_FILE" >/dev/null 2>&1; then
+              IS_JSON=true
+            fi
           fi
 
-          # Base64-encode JSON and set as output only if small enough (avoid exceeding GitHub output size limits)
-          B64=$(base64 --wrap=0 "$RESULT_FILE" || base64 "$RESULT_FILE") || true
-          B64_LEN=$(echo -n "$B64" | wc -c || true)
-          MAX_OUTPUT_LEN=30000
-          if [ -n "$B64" ] && [ "$B64_LEN" -le "$MAX_OUTPUT_LEN" ]; then
-            # Use the recommended GITHUB_OUTPUT multiline format: key<<EOF / EOF on its own line
-            echo "analysis_b64<<EOF" >> "$GITHUB_OUTPUT"
-            printf '%s\n' "$B64" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
+          AGG_SCORE=""
+          if [ "$IS_JSON" = true ]; then
+            AGG_SCORE=$(jq -r '.summary.score // .score // ""' "$RESULT_FILE" || true)
+
+            # Base64-encode JSON and set as output only if small enough
+            B64=$(base64 --wrap=0 "$RESULT_FILE" || base64 "$RESULT_FILE") || true
+            B64_LEN=$(echo -n "$B64" | wc -c || true)
+            MAX_OUTPUT_LEN=30000
+            if [ -n "$B64" ] && [ "$B64_LEN" -le "$MAX_OUTPUT_LEN" ]; then
+              echo "analysis_b64<<EOF" >> "$GITHUB_OUTPUT"
+              printf '%s\n' "$B64" >> "$GITHUB_OUTPUT"
+              echo "EOF" >> "$GITHUB_OUTPUT"
+            else
+              echo "analysis_b64=" >> "$GITHUB_OUTPUT"
+              echo "analysis_truncated=true" >> "$GITHUB_OUTPUT"
+            fi
           else
-            # too large to include in workflow outputs
+            # Not JSON: consolidate outputs into a log and skip JSON parsing
+            echo "Non-JSON output detected from Scorecard run; saving to $RESULT_LOG"
+            cat "$RESULT_FILE" > "$RESULT_LOG" 2>/dev/null || true
+            if [ -s "$STDERR_FILE" ]; then
+              echo "\n--- STDERR ---\n" >> "$RESULT_LOG"
+              cat "$STDERR_FILE" >> "$RESULT_LOG" || true
+            fi
             echo "analysis_b64=" >> "$GITHUB_OUTPUT"
             echo "analysis_truncated=true" >> "$GITHUB_OUTPUT"
           fi
@@ -148,14 +198,21 @@ jobs:
           echo "aggregate_score=$AGG_SCORE" >> "$GITHUB_OUTPUT"
           echo "result_file=$RESULT_FILE" >> "$GITHUB_OUTPUT"
 
-          # Add the Score to the step summary
-          echo "$REPO_INPUT score: $AGG_SCORE" >> $GITHUB_STEP_SUMMARY
+          # Add the Score (or note) to the step summary
+          if [ "$IS_JSON" = true ]; then
+            echo "$REPO_INPUT score: $AGG_SCORE" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "$REPO_INPUT: Scorecard did not produce JSON; see $RESULT_LOG" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Upload Scorecard result as artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.run-score.outputs.artifact_name }}
-          path: ${{ steps.run-score.outputs.result_file }}
+          path: |
+            ${{ steps.run-score.outputs.result_file }}
+            ossf-scorecard-output/scorecard_${{ steps.set-id.outputs.id }}.log
+            ossf-scorecard-output/scorecard_${{ steps.set-id.outputs.id }}.stderr.log
 
       - name: Get artifact download URL
         id: get-artifact-url
