@@ -55,7 +55,27 @@ jobs:
             ID="${{ github.event.inputs.id }}"
           fi
 
-          ARTIFACT_NAME="ossf-scorecard_${ID}"
+          # Sanitize repo input to a filesystem-safe token for artifact names
+          REPO_INPUT_RAW="${{ github.event.inputs.repo }}"
+          REPO_PATH="$REPO_INPUT_RAW"
+          # strip protocol/host for full URLs (e.g. https://github.com/owner/repo -> owner/repo)
+          if echo "$REPO_PATH" | grep -E '^https?://' >/dev/null 2>&1; then
+            REPO_PATH=$(echo "$REPO_PATH" | sed -E 's#^https?://[^/]+/##')
+          fi
+          # strip git@host:owner/repo forms
+          if echo "$REPO_PATH" | grep -E '^git@' >/dev/null 2>&1; then
+            REPO_PATH=$(echo "$REPO_PATH" | sed -E 's#^git@[^:]+:##')
+          fi
+          # trim trailing .git if present
+          REPO_PATH=$(echo "$REPO_PATH" | sed -E 's#\.git$##')
+          # fallback if empty
+          if [ -z "$REPO_PATH" ] || [ "$REPO_PATH" = "null" ]; then
+            REPO_PATH="unknown_repo"
+          fi
+          # make filename-safe: replace / and other non-alphanum with _
+          REPO_SAFE=$(printf '%s' "$REPO_PATH" | sed -E 's#[/\\ ]#_#g' | sed 's/[^0-9A-Za-z._-]/_/g')
+
+          ARTIFACT_NAME="ossf-scorecard_${REPO_SAFE}_${ID}"
 
           echo "id=$ID" >> "$GITHUB_OUTPUT"
           echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
