@@ -149,7 +149,7 @@ jobs:
           echo "Timestamp: $(date --utc +%Y-%m-%dT%H:%M:%SZ)" > "$RESULT_LOG" || true
           echo "Docker exit code: ${DOCKER_EXIT_CODE}" >> "$RESULT_LOG" || true
 
-          # Prepare artifact name
+          # Prepare artifact name (start with the base name produced by set-id)
           ARTIFACT_NAME="${{ steps.set-id.outputs.artifact_name }}"
 
           # Validate JSON before parsing; install jq if needed
@@ -167,10 +167,25 @@ jobs:
 
           AGG_SCORE=""
           if [ "$IS_JSON" = true ]; then
-            AGG_SCORE=$(jq -r '.summary.score // .score // ""' "$RESULT_FILE" || true)
+              AGG_SCORE=$(jq -r '.summary.score // .score // ""' "$RESULT_FILE" || true)
 
-            # Base64-encode JSON and set as output only if small enough
-            B64=$(base64 --wrap=0 "$RESULT_FILE" || base64 "$RESULT_FILE") || true
+              # If we detected a score, append it to the result filename: score_<value>
+              if [ -n "$AGG_SCORE" ]; then
+                # sanitize score for filename (replace non-alphanum with _ and dots with _)
+                SCORE_SAFE=$(printf '%s' "$AGG_SCORE" | sed 's/[^0-9A-Za-z._-]/_/g' | sed 's/\./_/g')
+                NEW_RESULT_FILE="$OUT_DIR/scorecard_${{ steps.set-id.outputs.id }}_score_${SCORE_SAFE}.json"
+                if [ -f "$RESULT_FILE" ]; then
+                  mv "$RESULT_FILE" "$NEW_RESULT_FILE" || cp "$RESULT_FILE" "$NEW_RESULT_FILE" || true
+                else
+                  touch "$NEW_RESULT_FILE" || true
+                fi
+                RESULT_FILE="$NEW_RESULT_FILE"
+                # Also append the score to the artifact name so uploaded artifact reflects the score
+                ARTIFACT_NAME="${ARTIFACT_NAME}_score_${SCORE_SAFE}"
+              fi
+
+              # Base64-encode JSON and set as output only if small enough
+              B64=$(base64 --wrap=0 "$RESULT_FILE" || base64 "$RESULT_FILE") || true
             B64_LEN=$(echo -n "$B64" | wc -c || true)
             MAX_OUTPUT_LEN=30000
             if [ -n "$B64" ] && [ "$B64_LEN" -le "$MAX_OUTPUT_LEN" ]; then
