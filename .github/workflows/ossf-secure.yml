@@ -1,0 +1,229 @@
+# OSSF Scorecard Analysis workflow
+# - Trigger: workflow_dispatch with input "repo" (owner/repo or full URL) and optional "checks".
+# - Runs the OpenSSF Scorecard Docker image (gcr.io/openssf/scorecard:stable) on an Ubuntu runner.
+# - Produces a JSON result at ossf-scorecard-output/scorecard.json and uploads it as an artifact.
+# - Job outputs: artifact_name, aggregate_score, analysis_b64 (base64 JSON if small enough; analysis_truncated=true otherwise).
+# - How to run: from the Actions tab, start the workflow and provide repo = owner/repo (or full GitHub URL).
+# - For higher rate limits or private repos, set repository secret SCORECARD_TOKEN (falls back to GITHUB_TOKEN).
+
+name: OSSF Scorecard
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Repository to analyze (owner/repo or full URL)'
+        required: true
+        default: ''
+      id: 
+        description: 'Unique identifier for the workflow run (for tracking purposes)'
+        required: true
+        default: ''
+      checks:
+        description: 'Comma-separated checks to run (optional)'
+        required: false
+        default: ''
+
+# read access is required for retrieving repository metadata if using the default GITHUB_TOKEN
+permissions:
+  contents: read
+
+jobs:
+  ossf-scorecard:
+    name: Run OSSF Scorecard
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.set-id.outputs.artifact_name }}
+      aggregate_score: ${{ steps.run-score.outputs.aggregate_score }}
+      analysis_b64: ${{ steps.run-score.outputs.analysis_b64 }}
+      artifact_download_url: ${{ steps.get-artifact-url.outputs.download_url }}
+
+    steps:
+
+      - name: Set workflow run ID
+        id: set-id
+        run: |
+          # If the 'id' input is empty or an empty string, set it to a unique GUID
+          if [ -z "${{ github.event.inputs.id }}" ] || [ "${{ github.event.inputs.id }}" = "null" ]; then
+            # Generate a GUID (UUID v4)
+            if command -v uuidgen >/dev/null 2>&1; then
+              ID=$(uuidgen)
+            else
+              ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || (head -c16 /dev/urandom | xxd -p | sed 's/\(..\)/\1-/g; s/-$//'))
+            fi
+          else
+            ID="${{ github.event.inputs.id }}"
+          fi
+
+          # Sanitize repo input to a filesystem-safe token for artifact names
+          REPO_INPUT_RAW="${{ github.event.inputs.repo }}"
+          REPO_PATH="$REPO_INPUT_RAW"
+          # strip protocol/host for full URLs (e.g. https://github.com/owner/repo -> owner/repo)
+          if echo "$REPO_PATH" | grep -E '^https?://' >/dev/null 2>&1; then
+            REPO_PATH=$(echo "$REPO_PATH" | sed -E 's#^https?://[^/]+/##')
+          fi
+          # strip git@host:owner/repo forms
+          if echo "$REPO_PATH" | grep -E '^git@' >/dev/null 2>&1; then
+            REPO_PATH=$(echo "$REPO_PATH" | sed -E 's#^git@[^:]+:##')
+          fi
+          # trim trailing .git if present
+          REPO_PATH=$(echo "$REPO_PATH" | sed -E 's#\.git$##')
+          # fallback if empty
+          if [ -z "$REPO_PATH" ] || [ "$REPO_PATH" = "null" ]; then
+            REPO_PATH="unknown_repo"
+          fi
+          # make filename-safe: replace / and other non-alphanum with _
+          REPO_SAFE=$(printf '%s' "$REPO_PATH" | sed -E 's#[/\\ ]#_#g' | sed 's/[^0-9A-Za-z._-]/_/g')
+
+          ARTIFACT_NAME="ossf-scorecard_${REPO_SAFE}_${ID}"
+
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "Workflow run ID: $ID"
+          echo "Artifact name: $ARTIFACT_NAME"
+
+          # Add the ID to the step summary
+          echo "Workflow run INPUT_GUID_ID: $ID" >> $GITHUB_STEP_SUMMARY
+
+      - name: Restore Scorecard image cache
+        id: cache-scorecard-image
+        uses: actions/cache@v4
+        with:
+          path: scorecard_image.tar
+          key: scorecard-image-${{ runner.os }}-gcr-ossf-scorecard-stable
+
+      - name: Load cached Scorecard image
+        if: steps.cache-scorecard-image.outputs.cache-hit == 'true'
+        run: |
+          if [ -f scorecard_image.tar ]; then
+            echo "Loading cached Scorecard image..."
+            docker load -i scorecard_image.tar || true
+          else
+            echo "Cache indicated hit but tarball missing; proceeding to pull image."
+          fi
+
+      - name: Pull and save Scorecard image (cache miss)
+        if: steps.cache-scorecard-image.outputs.cache-hit != 'true'
+        run: |
+          echo "Pulling Scorecard image from registry..."
+          docker pull gcr.io/openssf/scorecard:stable
+          echo "Saving Scorecard image to tar for caching..."
+          docker save gcr.io/openssf/scorecard:stable -o scorecard_image.tar
+
+      - name: Normalize Repository Input
+        id: normalize-repo
+        run: |
+          REPO_INPUT="${{ github.event.inputs.repo }}"
+          if [ -z "$REPO_INPUT" ] || [ "$REPO_INPUT" = "null" ]; then
+            echo "error: Repository input is required." >&2
+            exit 1
+          fi
+
+          # Normalize the repo argument
+          if echo "$REPO_INPUT" | grep -E '^https?://' >/dev/null 2>&1; then
+            REPO_ARG="$REPO_INPUT"
+          elif echo "$REPO_INPUT" | grep -E '^[^/]+/[^/]+$' >/dev/null 2>&1; then
+            REPO_ARG="https://github.com/$REPO_INPUT"
+          else
+            echo "error: Repo input must be 'owner/repo' or a full URL." >&2
+            exit 1
+          fi
+
+          echo "repo_arg=$REPO_ARG" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Output Directory
+        id: prepare-output
+        run: |
+          OUT_DIR="${{ github.workspace }}/ossf-scorecard-output"
+          mkdir -p "$OUT_DIR"
+          RESULT_FILE="$OUT_DIR/scorecard_${{ steps.set-id.outputs.id }}.json"
+          STDERR_FILE="$OUT_DIR/scorecard_${{ steps.set-id.outputs.id }}.stderr.log"
+          RESULT_LOG="$OUT_DIR/scorecard_${{ steps.set-id.outputs.id }}.log"
+
+          echo "result_file=$RESULT_FILE" >> "$GITHUB_OUTPUT"
+          echo "stderr_file=$STDERR_FILE" >> "$GITHUB_OUTPUT"
+          echo "result_log=$RESULT_LOG" >> "$GITHUB_OUTPUT"
+
+      - name: Run Scorecard (Docker)
+        id: run-docker
+        run: |
+          TOKEN="${{ secrets.SCORECARD_TOKEN }}"
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+
+          DOCKER_ENV_ARGS=()
+          if [ -n "$TOKEN" ]; then
+            DOCKER_ENV_ARGS+=( -e GITHUB_AUTH_TOKEN="$TOKEN" )
+          fi
+
+          docker run --rm "${DOCKER_ENV_ARGS[@]}" gcr.io/openssf/scorecard:stable --format=json --repo="${{ steps.normalize-repo.outputs.repo_arg }}" > "${{ steps.prepare-output.outputs.result_file }}" 2> "${{ steps.prepare-output.outputs.stderr_file }}"
+          echo "docker_exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Validate JSON Output
+        id: validate-json
+        run: |
+          RESULT_FILE="${{ steps.prepare-output.outputs.result_file }}"
+          if jq -e . "$RESULT_FILE" >/dev/null 2>&1; then
+            echo "is_json=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_json=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Process Results
+        id: process-results
+        if: steps.validate-json.outputs.is_json == 'true'
+        run: |
+          RESULT_FILE="${{ steps.prepare-output.outputs.result_file }}"
+          AGG_SCORE=$(jq -r '.summary.score // .score // ""' "$RESULT_FILE" || true)
+
+          if [ -n "$AGG_SCORE" ]; then
+            SCORE_SAFE=$(printf '%s' "$AGG_SCORE" | sed 's/[^0-9A-Za-z._-]/_/g' | sed 's/\./_/g')
+            ARTIFACT_NAME="${{ steps.set-id.outputs.artifact_name }}_score_${SCORE_SAFE}"
+          else
+            ARTIFACT_NAME="${{ steps.set-id.outputs.artifact_name }}"
+          fi
+
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "aggregate_score=$AGG_SCORE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.process-results.outputs.artifact_name }}
+          path: |
+            ${{ steps.prepare-output.outputs.result_file }}
+            ${{ steps.prepare-output.outputs.result_log }}
+            ${{ steps.prepare-output.outputs.stderr_file }}
+
+      - name: Get artifact download URL
+        id: get-artifact-url
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Ensure jq and curl are available
+          sudo apt-get update && sudo apt-get install -y jq curl
+
+          ARTIFACT_NAME="${{ steps.run-score.outputs.artifact_name }}"
+          echo "Looking up artifact named: $ARTIFACT_NAME"
+
+          RESP=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts")
+          DOWNLOAD_URL=$(echo "$RESP" | jq -r --arg name "$ARTIFACT_NAME" '.artifacts[] | select(.name==$name) | .archive_download_url' | head -n1)
+
+          if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
+            echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+            mkdir -p ossf-scorecard-output
+            echo "$DOWNLOAD_URL" > ossf-scorecard-output/artifact_download_url.txt
+          else
+            echo "download_url=" >> $GITHUB_OUTPUT
+            echo "warning: artifact not found in run artifacts" >&2
+          fi
+
+      - name: Show short summary
+        run: |
+          echo "Workflow input run: ${{ steps.set-id.outputs.id }}"
+          echo "Artifact: ${{ steps.run-score.outputs.artifact_name }}"
+          echo "Artifact URL: ${{ steps.get-artifact-url.outputs.download_url }}"
+          echo "Scorecard FileName: ${{ steps.run-score.outputs.result_file}}"
+          echo "Aggregate score: ${{ steps.run-score.outputs.aggregate_score }}"
