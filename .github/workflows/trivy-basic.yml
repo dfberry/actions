@@ -1,6 +1,8 @@
 name: trivy basic
+
 on:
   workflow_dispatch:
+    inputs:
       repoOwner:
         description: 'Repository owner'
         required: true
