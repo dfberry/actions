@@ -60,4 +60,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: trivy-results-${{ github.event.inputs.repoOwner }}-${{ github.event.inputs.repoName }}-${{ github.event.inputs.runId }}
-          path: trivy-results.sarif
+          path: trivy-results.json
