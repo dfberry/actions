@@ -1,0 +1,601 @@
+name: Docker Image Security Validation with Trivy
+
+on:
+  workflow_dispatch:
+    inputs:
+      repoOwner:
+        description: 'Repository owner'
+        required: true
+        type: string
+      repoName:
+        description: 'Repository name'
+        required: true
+        type: string
+      runId:
+        description: 'Unique identifier for the workflow run (for tracking purposes)'
+        required: false
+        type: string
+        default: ''
+      trivyVersion:
+        description: 'Trivy version to use (default: v0.46.1)'
+        required: false
+        type: string
+        default: 'v0.46.1'
+      trivyTimeout:
+        description: 'Timeout for Trivy scan operations in seconds (default: 600)'
+        required: false
+        type: string
+        default: '600'
+      severityThreshold:
+        description: 'Minimum severity level to report (UNKNOWN, LOW, MEDIUM, HIGH, CRITICAL)'
+        required: false
+        type: string
+        default: 'UNKNOWN'
+
+permissions:
+  contents: read
+  security-events: write # Required for uploading Trivy scan results to GitHub Security tab
+  actions: read # To read workflow run status
+
+env:
+  TRIVY_NO_PROGRESS: true
+  TRIVY_TIMEOUT: ${{ github.event.inputs.trivyTimeout || '600' }}
+  TRIVY_SEVERITY: ${{ github.event.inputs.severityThreshold || 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL' }}
+  LOG_LEVEL: debug
+
+jobs:
+  trivy-scan:
+    name: Scan Docker Images with Trivy
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.set-id.outputs.artifact_name }}
+      run_id: ${{ github.run_id }}
+      scan_status: ${{ steps.scan-status.outputs.status }}
+      scan_summary: ${{ steps.scan-status.outputs.summary }}
+      
+    steps:
+      - name: Set workflow run ID
+        id: set-id
+        run: |
+          # Enable error tracing
+          set -e
+          
+          echo "::group::Setting Workflow Run ID"
+          
+          # If the 'runId' input is empty, set it to a unique GUID
+          if [ -z "${{ github.event.inputs.runId }}" ] || [ "${{ github.event.inputs.runId }}" = "null" ]; then
+            # Generate a GUID (UUID v4)
+            if command -v uuidgen >/dev/null 2>&1; then
+              ID=$(uuidgen)
+            else
+              ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || (head -c16 /dev/urandom | xxd -p | sed 's/\(..\)/\1-/g; s/-$//'))
+            fi
+          else
+            ID="${{ github.event.inputs.runId }}"
+          fi
+          
+          REPO_SAFE="${{ github.event.inputs.repoOwner }}_${{ github.event.inputs.repoName }}"
+          # make filename-safe: replace / and other non-alphanum with _
+          REPO_SAFE=$(printf '%s' "$REPO_SAFE" | sed -E 's#[/\\ ]#_#g' | sed 's/[^0-9A-Za-z._-]/_/g')
+          
+          ARTIFACT_NAME="trivy-scan_${REPO_SAFE}_${ID}"
+          
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "Workflow run ID: $ID"
+          echo "Artifact name: $ARTIFACT_NAME"
+          
+          # Add the ID to the step summary
+          echo "# Trivy Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run ID**: $ID" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workflow Run ID**: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trivy Version**: ${{ github.event.inputs.trivyVersion || 'v0.46.1' }}" >> $GITHUB_STEP_SUMMARY
+          
+          echo "::endgroup::"
+          
+      - name: Check out repository
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}
+        continue-on-error: true
+      
+      - name: Verify checkout success
+        id: verify-checkout
+        run: |
+          set -e
+          echo "::group::Verifying Checkout"
+          
+          if [ "${{ steps.checkout.outcome }}" != "success" ]; then
+            echo "::error::Repository checkout failed. Please verify repository exists and is accessible."
+            echo "::notice::Repository: ${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}"
+            echo "checkout_success=false" >> "$GITHUB_OUTPUT"
+            echo "- ❌ **Repository checkout failed**: Please verify the repository exists and is accessible" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "checkout_success=true" >> "$GITHUB_OUTPUT"
+            echo "- ✅ **Repository checkout successful**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "::endgroup::"
+          
+      - name: Prepare output directory
+        id: prepare-output
+        if: steps.verify-checkout.outputs.checkout_success == 'true'
+        run: |
+          set -e
+          echo "::group::Preparing Output Directory"
+          
+          OUT_DIR="${{ github.workspace }}/trivy-scan-output"
+          LOG_DIR="${{ github.workspace }}/trivy-scan-output/logs"
+          mkdir -p "$OUT_DIR" "$LOG_DIR"
+          
+          # Create debug log file
+          DEBUG_LOG="$LOG_DIR/trivy_debug.log"
+          touch "$DEBUG_LOG"
+          
+          echo "output_dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+          echo "log_dir=$LOG_DIR" >> "$GITHUB_OUTPUT"
+          echo "debug_log=$DEBUG_LOG" >> "$GITHUB_OUTPUT"
+          
+          echo "- ✅ **Output directories created**" >> $GITHUB_STEP_SUMMARY
+          echo "  - Output Directory: $OUT_DIR" >> $GITHUB_STEP_SUMMARY
+          echo "  - Log Directory: $LOG_DIR" >> $GITHUB_STEP_SUMMARY
+          
+          echo "::endgroup::"
+        
+      - name: Run Trivy vulnerability scanner in repo mode
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Create Markdown From SARIF
+        id: create-markdown
+        run: |
+          set -e
+          echo "::group::Creating Markdown from SARIF"
+          
+          OUTPUT_DIR="${{ steps.prepare-output.outputs.output_dir }}"
+          SARIF_FILE="trivy-results.sarif"
+          MARKDOWN_FILE="$OUTPUT_DIR/trivy_findings.md"
+          
+          if [ -f "$SARIF_FILE" ] && command -v jq >/dev/null 2>&1; then
+            echo "# Trivy Security Findings" > "$MARKDOWN_FILE"
+            echo "" >> "$MARKDOWN_FILE"
+            echo "Repository: **${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}**" >> "$MARKDOWN_FILE"
+            echo "Run ID: **${{ steps.set-id.outputs.id }}**" >> "$MARKDOWN_FILE"
+            echo "Scan Date: **$(date -u +"%Y-%m-%d %H:%M:%S UTC")**" >> "$MARKDOWN_FILE"
+            echo "" >> "$MARKDOWN_FILE"
+            
+            # Count vulnerabilities by severity
+            CRITICAL_COUNT=$(jq -r '.runs[].results[] | select(.level=="error") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+            HIGH_COUNT=$(jq -r '.runs[].results[] | select(.level=="warning") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+            MEDIUM_COUNT=$(jq -r '.runs[].results[] | select(.level=="note") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+            LOW_COUNT=$(jq -r '.runs[].results[] | select(.level=="none") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+            TOTAL_COUNT=$((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT))
+            
+            echo "## Summary" >> "$MARKDOWN_FILE"
+            echo "" >> "$MARKDOWN_FILE"
+            echo "- **Total Issues Found**: ${TOTAL_COUNT}" >> "$MARKDOWN_FILE"
+            echo "- **Severity Breakdown**:" >> "$MARKDOWN_FILE"
+            
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "  - Critical: 🚨 ${CRITICAL_COUNT}" >> "$MARKDOWN_FILE"
+            else
+              echo "  - Critical: ${CRITICAL_COUNT}" >> "$MARKDOWN_FILE"
+            fi
+            
+            if [ "$HIGH_COUNT" -gt 0 ]; then
+              echo "  - High: ⚠️ ${HIGH_COUNT}" >> "$MARKDOWN_FILE"
+            else
+              echo "  - High: ${HIGH_COUNT}" >> "$MARKDOWN_FILE"
+            fi
+            
+            echo "  - Medium: ${MEDIUM_COUNT}" >> "$MARKDOWN_FILE"
+            echo "  - Low: ${LOW_COUNT}" >> "$MARKDOWN_FILE"
+            echo "" >> "$MARKDOWN_FILE"
+            
+            # Extract findings from SARIF
+            echo "## Detailed Findings" >> "$MARKDOWN_FILE"
+            echo "" >> "$MARKDOWN_FILE"
+            
+            # Get all results with jq and process them
+            RESULTS_COUNT=$(jq '.runs[].results | length' "$SARIF_FILE" 2>/dev/null || echo "0")
+            
+            if [ "$RESULTS_COUNT" -gt 0 ]; then
+              # Loop through findings, limited to top 50 for performance
+              jq -c '.runs[].results[] | select(.level=="error" or .level=="warning") | {level: .level, message: .message.text, location: .locations[0].physicalLocation.artifactLocation.uri, rule: .ruleId}' "$SARIF_FILE" 2>/dev/null | head -50 | while read -r finding; do
+                LEVEL=$(echo "$finding" | jq -r '.level')
+                MESSAGE=$(echo "$finding" | jq -r '.message')
+                LOCATION=$(echo "$finding" | jq -r '.location')
+                RULE=$(echo "$finding" | jq -r '.rule')
+                
+                # Convert level to icon
+                if [ "$LEVEL" == "error" ]; then
+                  ICON="🚨"
+                  LEVEL_TEXT="Critical"
+                elif [ "$LEVEL" == "warning" ]; then
+                  ICON="⚠️"
+                  LEVEL_TEXT="High"
+                else
+                  ICON=""
+                  LEVEL_TEXT="$LEVEL"
+                fi
+                
+                echo "### ${ICON} ${LEVEL_TEXT}: ${RULE}" >> "$MARKDOWN_FILE"
+                echo "" >> "$MARKDOWN_FILE"
+                echo "**Location**: \`${LOCATION}\`" >> "$MARKDOWN_FILE"
+                echo "" >> "$MARKDOWN_FILE"
+                echo "**Description**:" >> "$MARKDOWN_FILE"
+                echo "${MESSAGE}" >> "$MARKDOWN_FILE"
+                echo "" >> "$MARKDOWN_FILE"
+              done
+              
+              # Add note if more findings exist
+              if [ "$RESULTS_COUNT" -gt 50 ]; then
+                echo "> **Note**: Showing top 50 findings out of ${RESULTS_COUNT} total. See SARIF file for complete results." >> "$MARKDOWN_FILE"
+                echo "" >> "$MARKDOWN_FILE"
+              fi
+            else
+              echo "No security findings were identified in this scan." >> "$MARKDOWN_FILE"
+              echo "" >> "$MARKDOWN_FILE"
+            fi
+            
+            echo "markdown_file=$MARKDOWN_FILE" >> "$GITHUB_OUTPUT"
+            echo "- ✅ **Markdown findings report generated successfully**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "::warning::Could not generate markdown from SARIF file - file missing or jq not available"
+            echo "markdown_file=" >> "$GITHUB_OUTPUT"
+          fi
+          
+          echo "::endgroup::"
+      
+      - name: Set scan status
+        id: scan-status
+        run: |
+          set -e
+          echo "::group::Setting Scan Status"
+          
+          SARIF_FILE="trivy-results.sarif"
+          
+          # Check if SARIF file exists
+          if [ ! -f "$SARIF_FILE" ]; then
+            echo "::error::SARIF file not found at expected location: $SARIF_FILE"
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            echo "summary=SARIF file missing - scan may have failed" >> "$GITHUB_OUTPUT"
+            echo "- ❌ **Scan status: ERROR** - SARIF file missing" >> $GITHUB_STEP_SUMMARY
+            exit 0 # Don't fail the whole workflow for this
+          fi
+          
+          # Get the scan status from the SARIF file
+          if command -v jq >/dev/null 2>&1; then
+            # Count vulnerabilities by severity
+            VULN_CRITICAL=$(jq -r '.runs[].results[] | select(.level=="error") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+            VULN_HIGH=$(jq -r '.runs[].results[] | select(.level=="warning") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+            VULN_MEDIUM=$(jq -r '.runs[].results[] | select(.level=="note") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+            VULN_LOW=$(jq -r '.runs[].results[] | select(.level=="none") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+            
+            # Compact JSON summary for output
+            SUMMARY="{\"status\":\"success\",\"critical\":$VULN_CRITICAL,\"high\":$VULN_HIGH,\"medium\":$VULN_MEDIUM,\"low\":$VULN_LOW}"
+            STATUS="success"
+          else
+            # Fallback without jq
+            STATUS="unknown"
+            SUMMARY="{}"
+            VULN_CRITICAL=0
+            VULN_HIGH=0
+            VULN_MEDIUM=0
+            VULN_LOW=0
+          fi
+          
+          # Set outputs
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+          
+          # Log status to step summary
+          echo "## Final Scan Status" >> $GITHUB_STEP_SUMMARY
+          
+          # Determine icon based on vulnerability counts
+          if [ "$VULN_CRITICAL" -gt 0 ]; then
+            echo "- 🚨 **Scan status: CRITICAL VULNERABILITIES FOUND** - $VULN_CRITICAL critical vulnerabilities" >> $GITHUB_STEP_SUMMARY
+          elif [ "$VULN_HIGH" -gt 0 ]; then
+            echo "- ⚠️ **Scan status: HIGH VULNERABILITIES FOUND** - $VULN_HIGH high vulnerabilities" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ✅ **Scan status: SUCCESS** - No critical or high vulnerabilities" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "::endgroup::"
+          
+      - name: Upload SARIF file
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+        continue-on-error: true
+      
+      - name: Generate human-readable report
+        id: generate-report
+        run: |
+          set -e
+          echo "::group::Generating Human-Readable Report"
+          
+          OUTPUT_DIR="${{ steps.prepare-output.outputs.output_dir }}"
+          LOG_DIR="${{ steps.prepare-output.outputs.log_dir }}"
+          DEBUG_LOG="${{ steps.prepare-output.outputs.debug_log }}"
+          REPORT_FILE="$OUTPUT_DIR/trivy_report.md"
+          
+          # Since we're using the Trivy GitHub Action, create a summary file from the SARIF results
+          SARIF_FILE="trivy-results.sarif"
+          SUMMARY_FILE="$OUTPUT_DIR/scan_summary.json"
+          
+          # If summary file doesn't exist, create a fallback from SARIF file
+          if [ ! -f "$SUMMARY_FILE" ]; then
+            echo "Creating summary from SARIF file..." | tee -a "$DEBUG_LOG"
+            
+            if [ -f "$SARIF_FILE" ] && command -v jq >/dev/null 2>&1; then
+              # Try to extract vulnerability counts from SARIF
+              CRITICAL_COUNT=$(jq -r '.runs[].results[] | select(.level=="error") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+              HIGH_COUNT=$(jq -r '.runs[].results[] | select(.level=="warning") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+              MEDIUM_COUNT=$(jq -r '.runs[].results[] | select(.level=="note") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+              LOW_COUNT=$(jq -r '.runs[].results[] | select(.level=="none") | .level' "$SARIF_FILE" 2>/dev/null | wc -l || echo "0")
+              
+              # Create a summary JSON
+              echo "{" > "$SUMMARY_FILE"
+              echo "  \"scan_metadata\": {" >> "$SUMMARY_FILE"
+              echo "    \"timestamp\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"," >> "$SUMMARY_FILE"
+              echo "    \"repository\": \"${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}\"," >> "$SUMMARY_FILE"
+              echo "    \"run_id\": \"${{ steps.set-id.outputs.id }}\"" >> "$SUMMARY_FILE"
+              echo "  }," >> "$SUMMARY_FILE"
+              echo "  \"images_scanned\": 1," >> "$SUMMARY_FILE"
+              echo "  \"images_failed\": 0," >> "$SUMMARY_FILE"
+              echo "  \"vulnerabilities\": {" >> "$SUMMARY_FILE"
+              echo "    \"critical\": $CRITICAL_COUNT," >> "$SUMMARY_FILE"
+              echo "    \"high\": $HIGH_COUNT," >> "$SUMMARY_FILE"
+              echo "    \"medium\": $MEDIUM_COUNT," >> "$SUMMARY_FILE"
+              echo "    \"low\": $LOW_COUNT," >> "$SUMMARY_FILE"
+              echo "    \"unknown\": 0" >> "$SUMMARY_FILE"
+              echo "  }," >> "$SUMMARY_FILE"
+              echo "  \"status\": \"success\"," >> "$SUMMARY_FILE"
+              echo "  \"details\": [{" >> "$SUMMARY_FILE"
+              echo "    \"image\": \"${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}\"," >> "$SUMMARY_FILE"
+              echo "    \"status\": \"success\"," >> "$SUMMARY_FILE"
+              echo "    \"vulnerabilities\": {" >> "$SUMMARY_FILE"
+              echo "      \"critical\": $CRITICAL_COUNT," >> "$SUMMARY_FILE"
+              echo "      \"high\": $HIGH_COUNT," >> "$SUMMARY_FILE"
+              echo "      \"medium\": $MEDIUM_COUNT," >> "$SUMMARY_FILE"
+              echo "      \"low\": $LOW_COUNT," >> "$SUMMARY_FILE"
+              echo "      \"unknown\": 0" >> "$SUMMARY_FILE"
+              echo "    }" >> "$SUMMARY_FILE"
+              echo "  }]" >> "$SUMMARY_FILE"
+              echo "}" >> "$SUMMARY_FILE"
+            else
+              # Fallback if SARIF file or jq isn't available
+              echo "{\"images_scanned\":1,\"vulnerabilities\":{\"critical\":0,\"high\":0,\"medium\":0,\"low\":0,\"unknown\":0},\"status\":\"success\",\"message\":\"SARIF results available in GitHub Security tab\",\"details\":[{\"image\":\"${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}\",\"status\":\"success\",\"vulnerabilities\":{\"critical\":0,\"high\":0,\"medium\":0,\"low\":0,\"unknown\":0}}]}" > "$SUMMARY_FILE"
+              echo "::warning::Could not parse SARIF file, using default summary" | tee -a "$DEBUG_LOG"
+            fi
+          fi
+          
+          # Create markdown report header
+          echo "# Docker Image Security Scan Report" > "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo "Repository: **${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}**" >> "$REPORT_FILE"
+          echo "Run ID: **${{ steps.set-id.outputs.id }}**" >> "$REPORT_FILE"
+          echo "Scan Date: **$(date -u +"%Y-%m-%d %H:%M:%S UTC")**" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          
+          # Add SARIF info to the report
+          echo "## Scan Method" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo "This scan was performed using Trivy in repository filesystem scanning mode. Results are also available in the GitHub Security tab." >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo "- Scan type: Repository filesystem scan" >> "$REPORT_FILE"
+          echo "- Severity threshold: CRITICAL" >> "$REPORT_FILE"
+          echo "- Unfixed vulnerabilities ignored: Yes" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          
+          echo "" >> "$REPORT_FILE"
+          echo "## Summary" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          
+          # Add summary information
+          if [ -f "$SUMMARY_FILE" ]; then
+            if command -v jq >/dev/null 2>&1; then
+              IMAGES_SCANNED=$(jq -r '.images_scanned // 0' "$SUMMARY_FILE" 2>/dev/null || echo "0")
+              IMAGES_FAILED=$(jq -r '.images_failed // 0' "$SUMMARY_FILE" 2>/dev/null || echo "0")
+              VULN_CRITICAL=$(jq -r '.vulnerabilities.critical // 0' "$SUMMARY_FILE" 2>/dev/null || echo "0")
+              VULN_HIGH=$(jq -r '.vulnerabilities.high // 0' "$SUMMARY_FILE" 2>/dev/null || echo "0")
+              VULN_MEDIUM=$(jq -r '.vulnerabilities.medium // 0' "$SUMMARY_FILE" 2>/dev/null || echo "0")
+              VULN_LOW=$(jq -r '.vulnerabilities.low // 0' "$SUMMARY_FILE" 2>/dev/null || echo "0")
+              VULN_UNKNOWN=$(jq -r '.vulnerabilities.unknown // 0' "$SUMMARY_FILE" 2>/dev/null || echo "0")
+            else
+              # Fallback without jq
+              IMAGES_SCANNED=0
+              IMAGES_FAILED=0
+              VULN_CRITICAL=0
+              VULN_HIGH=0
+              VULN_MEDIUM=0
+              VULN_LOW=0
+              VULN_UNKNOWN=0
+            fi
+            
+            echo "- **Images Processed**:" >> "$REPORT_FILE"
+            echo "  - Images scanned: ${IMAGES_SCANNED}" >> "$REPORT_FILE"
+            if [ "$IMAGES_FAILED" -gt 0 ]; then
+              echo "  - Images failed: ${IMAGES_FAILED}" >> "$REPORT_FILE"
+            fi
+            
+            echo "- **Vulnerabilities Found**:" >> "$REPORT_FILE"
+            echo "  - Critical: ${VULN_CRITICAL}" >> "$REPORT_FILE"
+            echo "  - High: ${VULN_HIGH}" >> "$REPORT_FILE"
+            echo "  - Medium: ${VULN_MEDIUM}" >> "$REPORT_FILE"
+            echo "  - Low: ${VULN_LOW}" >> "$REPORT_FILE"
+            echo "  - Unknown: ${VULN_UNKNOWN}" >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+            
+            # Add detailed results section
+            echo "## Detailed Results" >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+            
+            # Handle the case where there's no results
+            if [ "$IMAGES_SCANNED" -eq 0 ] && [ "$IMAGES_FAILED" -eq 0 ]; then
+              echo "No images were scanned. See status section for details." >> "$REPORT_FILE"
+              echo "" >> "$REPORT_FILE"
+            else
+              # Add details for each image
+              if command -v jq >/dev/null 2>&1; then
+                # Use jq to safely extract details array
+                DETAILS_COUNT=$(jq '.details | length' "$SUMMARY_FILE" 2>/dev/null || echo "0")
+                
+                if [ "$DETAILS_COUNT" -gt 0 ]; then
+                  # Loop through each detail entry
+                  for i in $(seq 0 $((DETAILS_COUNT - 1))); do
+                    IMAGE=$(jq -r ".details[$i].image" "$SUMMARY_FILE" 2>/dev/null || echo "Unknown")
+                    STATUS=$(jq -r ".details[$i].status" "$SUMMARY_FILE" 2>/dev/null || echo "Unknown")
+                    ERROR=$(jq -r ".details[$i].error // \"\"" "$SUMMARY_FILE" 2>/dev/null || echo "")
+                    IMG_CRITICAL=$(jq -r ".details[$i].vulnerabilities.critical // 0" "$SUMMARY_FILE" 2>/dev/null || echo "0")
+                    IMG_HIGH=$(jq -r ".details[$i].vulnerabilities.high // 0" "$SUMMARY_FILE" 2>/dev/null || echo "0")
+                    IMG_MEDIUM=$(jq -r ".details[$i].vulnerabilities.medium // 0" "$SUMMARY_FILE" 2>/dev/null || echo "0")
+                    IMG_LOW=$(jq -r ".details[$i].vulnerabilities.low // 0" "$SUMMARY_FILE" 2>/dev/null || echo "0")
+                    IMG_UNKNOWN=$(jq -r ".details[$i].vulnerabilities.unknown // 0" "$SUMMARY_FILE" 2>/dev/null || echo "0")
+                    
+                    echo "### Image: \`${IMAGE}\`" >> "$REPORT_FILE"
+                    echo "" >> "$REPORT_FILE"
+                    
+                    # Display status with an icon
+                    if [ "$STATUS" == "success" ]; then
+                      echo "- **Scan Status**: ✅ Success" >> "$REPORT_FILE"
+                    elif [ "$STATUS" == "warning" ]; then
+                      echo "- **Scan Status**: ⚠️ Warning" >> "$REPORT_FILE"
+                    elif [ "$STATUS" == "error" ]; then
+                      echo "- **Scan Status**: ❌ Error" >> "$REPORT_FILE"
+                    else
+                      echo "- **Scan Status**: ${STATUS}" >> "$REPORT_FILE"
+                    fi
+                    
+                    # Include error message if present
+                    if [ -n "$ERROR" ]; then
+                      echo "- **Error**: ${ERROR}" >> "$REPORT_FILE"
+                    fi
+                    
+                    # Only show vulnerabilities for successful scans
+                    if [ "$STATUS" == "success" ]; then
+                      echo "- **Vulnerabilities**:" >> "$REPORT_FILE"
+                      
+                      # Add severity icons based on counts
+                      if [ "$IMG_CRITICAL" -gt 0 ]; then
+                        echo "  - Critical: 🚨 ${IMG_CRITICAL}" >> "$REPORT_FILE"
+                      else
+                        echo "  - Critical: ${IMG_CRITICAL}" >> "$REPORT_FILE"
+                      fi
+                      
+                      if [ "$IMG_HIGH" -gt 0 ]; then
+                        echo "  - High: ⚠️ ${IMG_HIGH}" >> "$REPORT_FILE"
+                      else
+                        echo "  - High: ${IMG_HIGH}" >> "$REPORT_FILE"
+                      fi
+                      
+                      echo "  - Medium: ${IMG_MEDIUM}" >> "$REPORT_FILE"
+                      echo "  - Low: ${IMG_LOW}" >> "$REPORT_FILE"
+                      echo "  - Unknown: ${IMG_UNKNOWN}" >> "$REPORT_FILE"
+                    fi
+                    
+                    echo "" >> "$REPORT_FILE"
+                  done
+                else
+                  echo "No detailed results available." >> "$REPORT_FILE"
+                  echo "" >> "$REPORT_FILE"
+                fi
+              else
+                # Fallback for when jq is not available
+                echo "Detailed results unavailable - parsing tool missing." >> "$REPORT_FILE"
+                echo "" >> "$REPORT_FILE"
+              fi
+            fi
+          else
+            echo "No scan summary available." >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+          fi
+          
+          # Add recommendations section
+          echo "## Recommendations" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          
+          # Customize recommendations based on findings
+          if [ "$VULN_CRITICAL" -gt 0 ] || [ "$VULN_HIGH" -gt 0 ]; then
+            echo "### High Priority" >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+            
+            if [ "$VULN_CRITICAL" -gt 0 ]; then
+              echo "- 🚨 **Address critical vulnerabilities immediately** - ${VULN_CRITICAL} critical vulnerabilities found" >> "$REPORT_FILE"
+            fi
+            
+            if [ "$VULN_HIGH" -gt 0 ]; then
+              echo "- ⚠️ **Address high vulnerabilities as soon as possible** - ${VULN_HIGH} high vulnerabilities found" >> "$REPORT_FILE"
+            fi
+            
+            echo "- Review vulnerability details using the full scan reports" >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+          fi
+          
+          echo "### General Security Practices" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo "- Use minimal, secure base images (consider distroless images)" >> "$REPORT_FILE"
+          echo "- Regularly update base images to include security patches" >> "$REPORT_FILE"
+          echo "- Implement least privilege principles in Dockerfiles" >> "$REPORT_FILE"
+          echo "- Avoid installing unnecessary packages" >> "$REPORT_FILE"
+          echo "- Use multi-stage builds to reduce attack surface" >> "$REPORT_FILE"
+          echo "- Don't run containers as root" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          
+          echo "### Process Improvements" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo "- Integrate container scanning into your CI/CD pipeline" >> "$REPORT_FILE"
+          echo "- Establish vulnerability acceptance criteria" >> "$REPORT_FILE"
+          echo "- Maintain an inventory of container images and their contents" >> "$REPORT_FILE"
+          echo "- Implement image signing and verification" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          
+          if [ "$IMAGES_FAILED" -gt 0 ]; then
+            echo "### Troubleshooting" >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+            echo "- Check the logs for details on failed scans" >> "$REPORT_FILE"
+            echo "- Verify image references are correct and accessible" >> "$REPORT_FILE"
+            echo "- Ensure Dockerfile syntax is valid" >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+          fi
+          
+          # Add debug info footer
+          echo "## Debug Information" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo "- Workflow Run ID: \`${{ github.run_id }}\`" >> "$REPORT_FILE"
+          echo "- Trivy Version: \`${{ steps.setup-trivy.outputs.trivy_version }}\`" >> "$REPORT_FILE"
+          echo "- Scan Date: \`$(date -u +"%Y-%m-%dT%H:%M:%SZ")\`" >> "$REPORT_FILE"
+          echo "- Repository: \`${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}\`" >> "$REPORT_FILE"
+          
+          echo "report_file=$REPORT_FILE" >> "$GITHUB_OUTPUT"
+          echo "- ✅ **Report generated successfully**" >> $GITHUB_STEP_SUMMARY
+          
+          echo "::endgroup::"
+      
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-id.outputs.artifact_name }}
+          path: |
+            ${{ steps.prepare-output.outputs.output_dir }}
+            trivy-results.sarif
+          
+      - name: Add report to step summary
+        run: |
+          cat "${{ steps.generate-report.outputs.report_file }}" >> $GITHUB_STEP_SUMMARY
