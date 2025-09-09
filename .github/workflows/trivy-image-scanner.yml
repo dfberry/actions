@@ -2,6 +2,27 @@ name: Trivy this repo
 
 on:
   workflow_dispatch:
+    inputs:
+      repoOwner:
+        description: 'Repository owner'
+        required: true
+        type: string
+      repoName:
+        description: 'Repository name'
+        required: true
+        type: string
+      runId:
+        description: 'Unique identifier for the workflow run (for tracking purposes)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  security-events: write # Required for uploading Trivy scan results to GitHub Security tab
+  actions: read # To read workflow run status
+
+
 jobs:
   build:
     name: Build
@@ -9,6 +30,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}
+        continue-on-error: false
 
       - name: Find container image refs
         id: find-images
