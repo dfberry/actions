@@ -41,7 +41,7 @@ jobs:
           repository: ${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}
         continue-on-error: true
 
-      - name: Run Trivy vulnerability scanner in repo mode
+      - name: Run Trivy vulnerability scanner (SARIF)
         uses: aquasecurity/trivy-action@0.33.1
         with:
           scan-type: 'fs'
@@ -63,12 +63,12 @@ jobs:
 
       - name: Create summary.json from trivy-results.json
         run: |
-          jq -n --argfile r trivy-results.json '
-            def allv: ($r.Results | map(.Vulnerabilities // []) | add // []);
+          jq -n --slurpfile r trivy-results.json '
+            def allv: ($r[0].Results | map(.Vulnerabilities // []) | add // []);
             {
               total: (allv | length),
               by_severity: (allv | group_by(.Severity) | map({(.[0].Severity): length}) | add // {}),
-              per_target: ($r.Results | map({target: .Target, findings: ((.Vulnerabilities // []) | length)}))
+              per_target: ($r[0].Results | map({target: .Target, findings: ((.Vulnerabilities // []) | length)}))
             }' > summary.json
 
       - name: Upload Trivy scan results as artifact
