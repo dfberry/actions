@@ -46,18 +46,36 @@ jobs:
         with:
           scan-type: 'fs'
           ignore-unfixed: false
-          format: 'json'
-          output: 'trivy-results.json'
-          severity: 'HIGH'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
           scanners: 'vuln,secret,misconfig,license'
 
-      # - name: Upload Trivy scan results to GitHub Security tab
-      #   uses: github/codeql-action/upload-sarif@v3
-      #   with:
-      #     sarif_file: 'trivy-results.sarif'
+      - name: Run Trivy vulnerability scanner (JSON)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: false
+          format: 'json'
+          output: 'trivy-results.json'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          scanners: 'vuln,secret,misconfig,license'
+
+      - name: Create summary.json from trivy-results.json
+        run: |
+          jq -n --argfile r trivy-results.json '
+            def allv: ($r.Results | map(.Vulnerabilities // []) | add // []);
+            {
+              total: (allv | length),
+              by_severity: (allv | group_by(.Severity) | map({(.[0].Severity): length}) | add // {}),
+              per_target: ($r.Results | map({target: .Target, findings: ((.Vulnerabilities // []) | length)}))
+            }' > summary.json
 
       - name: Upload Trivy scan results as artifact
         uses: actions/upload-artifact@v4
         with:
           name: trivy-results-${{ github.event.inputs.repoOwner }}-${{ github.event.inputs.repoName }}-${{ github.event.inputs.runId }}
-          path: trivy-results.json
+          path: |
+            trivy-results.sarif
+            trivy-results.json
+            summary.json
