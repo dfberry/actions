@@ -70,26 +70,7 @@ jobs:
           sudo apt-get install -y ripgrep jq
           echo "Required tools installed." >> trivy.log
 
-      - name: Verify Trivy availability (install if missing)
-        run: |
-          echo "Verifying Trivy availability..." >> trivy.log
-          set +e
-          # Try to install Trivy; don't fail the job if install fails
-          if curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin >> trivy.log 2>&1; then
-            echo "trivy install script ran (or trivy already present)" >> trivy.log
-          else
-            echo "trivy install script failed or network error" >> trivy.log
-          fi
 
-          # Check if trivy is available now
-          if command -v trivy >/dev/null 2>&1; then
-            echo "trivy available: $(trivy --version 2>&1)" >> trivy.log
-            echo "stop_workflow=false" >> $GITHUB_ENV
-          else
-            echo "trivy CLI not available; setting stop_workflow=true to skip scans" >> trivy.log
-            echo "stop_workflow=true" >> $GITHUB_ENV
-          fi
-          set -e
 
       - name: Remove old files
         run: |
@@ -97,17 +78,6 @@ jobs:
           echo "Removing old files..." >> trivy.log
           rm -f candidate_files.txt files_with_images.txt tmp_images images.txt devcontainer_images.txt dockerfile_images.txt docker_compose_images.txt generic_images.txt || true
           echo "Old files removed." >> trivy.log
-
-
-      - name: Init scan log
-        run: |
-          echo "Trivy scan started: $(date -u)" >> trivy.log
-          # log incoming workflow_dispatch inputs individually
-          echo "repo_owner=${{ github.event.inputs.repoOwner }}" >> trivy.log
-          echo "repo_name=${{ github.event.inputs.repoName }}" >> trivy.log
-          echo "repo=${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}" >> trivy.log
-          echo "run_id=${{ github.event.inputs.runId }}" >> trivy.log
-
 
       - name: Find candidate files by filename patterns
         run: |
@@ -681,13 +651,26 @@ jobs:
             echo "trivy_installed=false" >> $GITHUB_ENV
           fi
 
-      - name: Init scan log
-        if: env.trivy_installed == 'true'
+      - name: Verify Trivy availability (install if missing)
         run: |
-          echo "Trivy scan started: $(date -u)" > trivy.log
-          echo "repo=${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}" >> trivy.log
-          echo "run_id=${{ github.event.inputs.runId }}" >> trivy.log
-          echo "found_images=$(wc -l < images.txt)" >> trivy.log
+          echo "Verifying Trivy availability..." >> trivy.log
+          set +e
+          # Try to install Trivy; don't fail the job if install fails
+          if curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin >> trivy.log 2>&1; then
+            echo "trivy install script ran (or trivy already present)" >> trivy.log
+          else
+            echo "trivy install script failed or network error" >> trivy.log
+          fi
+
+          # Check if trivy is available now
+          if command -v trivy >/dev/null 2>&1; then
+            echo "trivy available: $(trivy --version 2>&1)" >> trivy.log
+            echo "stop_workflow=false" >> $GITHUB_ENV
+          else
+            echo "trivy CLI not available; setting stop_workflow=true to skip scans" >> trivy.log
+            echo "stop_workflow=true" >> $GITHUB_ENV
+          fi
+          set -e
 
       - name: Scan repository 
         if: env.trivy_installed == 'true'
@@ -705,32 +688,54 @@ jobs:
             echo "scan_repo.json not created" | tee -a trivy.log
           fi
 
+      # - name: Remove images with unsupported artifact type "application/vnd.devcontainers"
+      #   if: env.trivy_installed == 'true'
+      #   run: |
+      #     echo "Filtering images with unsupported artifact type 'application/vnd.devcontainers'..." | tee -a trivy.log
+      #     touch filtered_images.txt
+      #     mkdir -p artifact_type_logs
+
+      #     while IFS= read -r img; do
+      #       [ -z "$img" ] && continue
+      #       # Check artifact types for this image
+      #       artifact_types=$(trivy image --list-artifact-types "$img" 2>&1 | tee "artifact_type_logs/${img//[^A-Za-z0-9._-]/_}.log")
+      #       if echo "$artifact_types" | grep -q "application/vnd.devcontainers"; then
+      #         echo "REMOVED: $img (unsupported artifact type)" | tee -a trivy.log
+      #       else
+      #         echo "$img" >> filtered_images.txt
+      #       fi
+      #     done < images.txt
+
+      #     mv filtered_images.txt images.txt
+      #     echo "Filtering by artifact type completed." | tee -a trivy.log
+
+
       - name: Scan discovered images
         if: env.trivy_installed == 'true'
         run: |
-          mkdir -p trivy-output
-          
+          set +e
+          mkdir -p failures
           # Check if images.txt exists and is not empty
           if [ ! -s images.txt ]; then
             echo "Error: images.txt is empty or doesn't exist" | tee -a trivy.log
             touch images.txt  # Create empty file if missing
           fi
-          
+
           while IFS= read -r img; do
-            # Skip empty lines
             [ -z "$img" ] && continue
-            
-            # sanitize name for filename (replace /:@sha256 etc)
             file=$(echo "$img" | sed -E 's/[^A-Za-z0-9._-]/_/g')
             echo "Scanning $img -> ${file}.json" | tee -a trivy.log
-            if trivy image --quiet --format json -o "${file}.json" "$img"; then
+            trivy image --quiet --format json -o "${file}.json" "$img"
+            status=$?
+            if [ $status -eq 0 ]; then
               echo "SUCCESS: $img" >> trivy.log
             else
               echo "FAILED: $img" >> trivy.log
-              echo "scan failed for $img" > "failures/${file}.scan_error"
-              echo "scan failed for $img" >> trivy.log
+              echo "scan failed for $img (exit code $status)" > "failures/${file}.scan_error"
+              echo "scan failed for $img (exit code $status)" >> trivy.log
             fi
           done < images.txt
+          set -e
 
       - name: Create combined summary.json
         if: env.trivy_installed == 'true'
