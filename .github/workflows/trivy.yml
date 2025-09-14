@@ -522,7 +522,7 @@ jobs:
     if: needs.find-images.outputs.stop_workflow != 'true'
     runs-on: ubuntu-latest
     steps:
-      # Only checkout the code when not running in Act
+      # Checkout and download artifacts as before
       - name: Checkout code
         if: env.ACT != 'true'
         uses: actions/checkout@v4
@@ -530,30 +530,20 @@ jobs:
           repository: ${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}
         continue-on-error: false
 
-      # Download the artifacts from the previous job (only when not running in Act)
       - name: Download image data
         if: env.ACT != 'true'
         uses: actions/download-artifact@v4
         with:
           name: find-images-${{ github.event.inputs.repoOwner }}-${{ github.event.inputs.repoName }}-${{ github.event.inputs.runId }}
-          
-            # When running with Act, get files from shared location
+
       - name: Get files from shared location (Act only)
         if: env.ACT == 'true'
         run: |
           echo "Running in Act mode - retrieving files from shared location..."
-          
-          # Ensure the directory exists
           sudo mkdir -p /tmp/act-shared-data
-          
-          # List the shared directory contents
           echo "Shared directory contents:"
           ls -la /tmp/act-shared-data/ || echo "Shared directory not found"
-          
-          # Ensure files exist to prevent errors
           touch images.txt trivy.log files_with_images.txt candidate_files.txt
-          
-          # Copy files from shared location to current working directory
           cp -f /tmp/act-shared-data/images.txt ./ || echo "images.txt not found in shared location"
           cp -f /tmp/act-shared-data/files_with_images.txt ./ || echo "files_with_images.txt not found in shared location" 
           cp -f /tmp/act-shared-data/trivy.log ./ || echo "trivy.log not found in shared location"
@@ -562,210 +552,52 @@ jobs:
           cp -f /tmp/act-shared-data/dockerfile_images.txt ./ 2>/dev/null || echo "dockerfile_images.txt not found"
           cp -f /tmp/act-shared-data/docker_compose_images.txt ./ 2>/dev/null || echo "docker_compose_images.txt not found"
           cp -f /tmp/act-shared-data/generic_images.txt ./ 2>/dev/null || echo "generic_images.txt not found"
-          
           echo "Using artifact from:"
           cat /tmp/act-shared-data/artifact-log.txt 2>/dev/null || echo "No artifact log found"
-          
           echo "Current directory contents after copying:"
           ls -la
 
-      - name: Log found images
+      # Generate matrix from images.txt
+      - name: Generate image matrix
+        id: matrix
         run: |
-          # Ensure files exist
-          touch images.txt trivy.log devcontainer_images.txt dockerfile_images.txt docker_compose_images.txt generic_images.txt
-          
-          # record both the step output and the actual images.txt line count
-          echo "found_images_output=${{ needs.find-images.outputs.found_count }}" >> trivy.log
-          echo "found_files_output=${{ needs.find-images.outputs.files_found }}" >> trivy.log
-          
-          # Check if images.txt has content before trying to count lines
-          if [ -s images.txt ]; then
-            echo "found_images_file=$(wc -l < images.txt)" >> trivy.log
-          else
-            echo "found_images_file=0" >> trivy.log
-          fi
-          
-          # Log the images found in each extraction method
-          echo "==== Images found in devcontainer.json files ====" | tee -a trivy.log
-          if [ -s devcontainer_images.txt ]; then
-            cat devcontainer_images.txt | tee -a trivy.log
-          else
-            echo "No images found in devcontainer.json files." | tee -a trivy.log
-          fi
-          echo "=================================================" | tee -a trivy.log
-          
-          echo "==== Images found in Dockerfiles ====" | tee -a trivy.log
-          if [ -s dockerfile_images.txt ]; then
-            cat dockerfile_images.txt | tee -a trivy.log
-          else
-            echo "No images found in Dockerfiles." | tee -a trivy.log
-          fi
-          echo "====================================" | tee -a trivy.log
-          
-          echo "==== Images found in Docker Compose files ====" | tee -a trivy.log
-          if [ -s docker_compose_images.txt ]; then
-            cat docker_compose_images.txt | tee -a trivy.log
-          else
-            echo "No images found in Docker Compose files." | tee -a trivy.log
-          fi
-          echo "=============================================" | tee -a trivy.log
-          
-          echo "==== Images found in other files ====" | tee -a trivy.log
-          if [ -s generic_images.txt ]; then
-            cat generic_images.txt | tee -a trivy.log
-          else
-            echo "No images found in other files." | tee -a trivy.log
-          fi
-          echo "===================================" | tee -a trivy.log
-          
-          # Log the actual images for visibility in both run output and log file
-          echo "==== All Found Docker Images (Deduplicated) ====" | tee -a trivy.log
-          if [ -s images.txt ]; then
-            cat images.txt | tee -a trivy.log
-          else
-            echo "No Docker images found." | tee -a trivy.log
-          fi
-          echo "=============================================" | tee -a trivy.log
+          images=$(jq -R -s -c 'split("\n") | map(select(length > 0))' images.txt)
+          echo "matrix={\"image\":$images}" >> $GITHUB_OUTPUT
 
-      - name: Install Trivy CLI
-        run: |
-          echo "Attempting to install Trivy..." | tee -a trivy.log
-          set +e
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-          set -e
-          
-          # This gets checked in the subsequent Verify step
+    outputs:
+      image-matrix: ${{ steps.matrix.outputs.matrix }}
 
-      - name: Debug stop_workflow variable
-        run: |
-          echo "stop_workflow==${{ needs.find-images.outputs.stop_workflow }}"
-
-      - name: Verify Trivy is installed
-        run: |
-          echo "Verifying trivy is installed..." | tee -a trivy.log
-          if command -v trivy >/dev/null 2>&1; then
-            trivy --version | tee -a trivy.log
-            echo "trivy_installed=true" >> $GITHUB_ENV
-          else
-            echo "Error: trivy CLI not found. Will skip scan steps." | tee -a trivy.log
-            echo "trivy_installed=false" >> $GITHUB_ENV
-          fi
-
-      - name: Verify Trivy availability (install if missing)
-        run: |
-          echo "Verifying Trivy availability..." >> trivy.log
-          set +e
-          # Try to install Trivy; don't fail the job if install fails
-          if curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin >> trivy.log 2>&1; then
-            echo "trivy install script ran (or trivy already present)" >> trivy.log
-          else
-            echo "trivy install script failed or network error" >> trivy.log
-          fi
-
-          # Check if trivy is available now
-          if command -v trivy >/dev/null 2>&1; then
-            echo "trivy available: $(trivy --version 2>&1)" >> trivy.log
-            echo "stop_workflow=false" >> $GITHUB_ENV
-          else
-            echo "trivy CLI not available; setting stop_workflow=true to skip scans" >> trivy.log
-            echo "stop_workflow=true" >> $GITHUB_ENV
-          fi
-          set -e
-
-      - name: Scan repository 
-        if: env.trivy_installed == 'true'
-        run: |
-          echo "Starting repository scan for ${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }}" | tee -a trivy.log
-
-          # Run a repo scan of the checked-out repository and save JSON
-          echo "Running trivy scan in $(pwd)" | tee -a trivy.log
-          trivy repo https://github.com/${{ github.event.inputs.repoOwner }}/${{ github.event.inputs.repoName }} --scanners misconfig --scanners license --scanners vuln --scanners secret --format json -o scan_repo.json . 2>> trivy.log || echo "trivy repo scan exited with non-zero status" >> trivy.log
-
-          # Log summary info
-          if [ -f scan_repo.json ]; then
-            echo "Wrote scan_repo.json ($(wc -c < scan_repo.json) bytes)" | tee -a trivy.log
-          else
-            echo "scan_repo.json not created" | tee -a trivy.log
-          fi
-
-      # - name: Remove images with unsupported artifact type "application/vnd.devcontainers"
-      #   if: env.trivy_installed == 'true'
-      #   run: |
-      #     echo "Filtering images with unsupported artifact type 'application/vnd.devcontainers'..." | tee -a trivy.log
-      #     touch filtered_images.txt
-      #     mkdir -p artifact_type_logs
-
-      #     while IFS= read -r img; do
-      #       [ -z "$img" ] && continue
-      #       # Check artifact types for this image
-      #       artifact_types=$(trivy image --list-artifact-types "$img" 2>&1 | tee "artifact_type_logs/${img//[^A-Za-z0-9._-]/_}.log")
-      #       if echo "$artifact_types" | grep -q "application/vnd.devcontainers"; then
-      #         echo "REMOVED: $img (unsupported artifact type)" | tee -a trivy.log
-      #       else
-      #         echo "$img" >> filtered_images.txt
-      #       fi
-      #     done < images.txt
-
-      #     mv filtered_images.txt images.txt
-      #     echo "Filtering by artifact type completed." | tee -a trivy.log
-
-
-      - name: Scan discovered images
-        if: env.trivy_installed == 'true'
+  scan-each-image:
+    name: Scan each Docker image
+    needs: scan-images
+    if: needs.scan-images.outputs.image-matrix != ''
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{fromJson(needs.scan-images.outputs.image-matrix)}}
+    steps:
+      - name: Scan image
         run: |
           set +e
           mkdir -p failures
-          # Check if images.txt exists and is not empty
-          if [ ! -s images.txt ]; then
-            echo "Error: images.txt is empty or doesn't exist" | tee -a trivy.log
-            touch images.txt  # Create empty file if missing
+          img="${{ matrix.image }}"
+          [ -z "$img" ] && exit 0
+          file=$(echo "$img" | sed -E 's/[^A-Za-z0-9._-]/_/g')
+          echo "Scanning $img -> ${file}.json" | tee -a trivy.log
+          trivy image --quiet --format json -o "${file}.json" "$img"
+          status=$?
+          if [ $status -eq 0 ]; then
+            echo "SUCCESS: $img" >> trivy.log
+          else
+            echo "FAILED: $img" >> trivy.log
+            echo "scan failed for $img (exit code $status)" > "failures/${file}.scan_error"
+            echo "scan failed for $img (exit code $status)" >> trivy.log
           fi
-
-          while IFS= read -r img; do
-            [ -z "$img" ] && continue
-            file=$(echo "$img" | sed -E 's/[^A-Za-z0-9._-]/_/g')
-            echo "Scanning $img -> ${file}.json" | tee -a trivy.log
-            trivy image --quiet --format json -o "${file}.json" "$img"
-            status=$?
-            if [ $status -eq 0 ]; then
-              echo "SUCCESS: $img" >> trivy.log
-            else
-              echo "FAILED: $img" >> trivy.log
-              echo "scan failed for $img (exit code $status)" > "failures/${file}.scan_error"
-              echo "scan failed for $img (exit code $status)" >> trivy.log
-            fi
-          done < images.txt
           set -e
 
-      - name: Create combined summary.json
-        if: env.trivy_installed == 'true'
-        run: |
-          mkdir -p combined
-          echo "Generating summary at $(date -u)" | tee -a trivy.log
-          
-          # Check if trivy-output directory exists and has json files
-          if [ -d "trivy-output" ] && ls *.json >/dev/null 2>&1; then
-            # attempt to build an aggregated summary; log jq output & errors
-            if jq -s 'def allv: (map(.Results // []) | map(.[] | .Vulnerabilities // []) | add // []); {
-              total: (allv | length),
-              by_severity: (allv | group_by(.Severity) | map({(.[0].Severity): length}) | add // {}),
-              per_file: (map({file: input_filename, total: ((.Results[]?.Vulnerabilities // []) | length)}) )
-            }' *.json > summary.json 2>> trivy.log; then
-              echo "Summary generated: $(wc -c < summary.json) bytes" >> trivy.log
-            else
-              echo "Summary generation failed; writing default summary" >> trivy.log
-              echo '{"total":0}' > summary.json
-            fi
-          else
-            echo "No JSON files found in trivy-output directory; writing default summary" >> trivy.log
-            echo '{"total":0}' > summary.json
-          fi
-
-      - name: Upload Trivy outputs artifacts
-        if: env.ACT != 'true'
+      - name: Upload scan outputs
         uses: actions/upload-artifact@v4
         with:
-          name: scan-${{ github.event.inputs.repoOwner }}-${{ github.event.inputs.repoName }}-${{ github.event.inputs.runId }}
+          name: scan-output-${{ matrix.image }}
           path: |
             *.json
             trivy.log
