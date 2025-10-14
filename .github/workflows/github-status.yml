@@ -1,0 +1,249 @@
+name: Last semester
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: 'Start date (YYYY-MM-DD)'
+        required: true
+        default: '2025-04-01'
+      to_date:
+        description: 'End date (YYYY-MM-DD)'
+        required: true
+        default: '2025-09-30'
+      username:
+        description: 'GitHub username to analyze'
+        required: true
+        default: 'diberry'
+  # schedule:
+  #   # Run monthly on the 1st at 9 AM UTC
+  #   - cron: '0 9 1 * *'
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    name: Generate GitHub Activity Report
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set default dates for scheduled runs
+      if: github.event_name == 'schedule'
+      run: |
+        # For scheduled runs, analyze the previous month
+        FROM_DATE=$(date -d "$(date +%Y-%m-01) -1 month" +%Y-%m-%d)
+        TO_DATE=$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m-%d)
+        echo "FROM_DATE=$FROM_DATE" >> $GITHUB_ENV
+        echo "TO_DATE=$TO_DATE" >> $GITHUB_ENV
+        echo "USERNAME=${{ github.repository_owner }}" >> $GITHUB_ENV
+        
+    - name: Set input dates for manual runs
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        echo "FROM_DATE=${{ github.event.inputs.from_date }}" >> $GITHUB_ENV
+        echo "TO_DATE=${{ github.event.inputs.to_date }}" >> $GITHUB_ENV
+        echo "USERNAME=${{ github.event.inputs.username }}" >> $GITHUB_ENV
+
+    - name: Generate Activity Report
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # Create reports directory
+        mkdir -p reports
+        
+        # Create debug log
+        touch reports/debug.log
+        echo "Debug log started at $(date -u)" > reports/debug.log
+        
+        # Set report filename with timestamp
+        REPORT_FILE="reports/activity-report-${FROM_DATE}-to-${TO_DATE}.md"
+        
+        echo "# GitHub Activity Report - All Repositories" > $REPORT_FILE
+        echo "" >> $REPORT_FILE
+        echo "**User:** $USERNAME" >> $REPORT_FILE
+        echo "**Period:** $FROM_DATE to $TO_DATE" >> $REPORT_FILE
+        echo "**Scope:** ALL repositories on GitHub (public and private accessible to user)" >> $REPORT_FILE
+        echo "**Search Method:** GitHub Search API - searches across entire GitHub platform" >> $REPORT_FILE
+        echo "**Generated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $REPORT_FILE
+        echo "" >> $REPORT_FILE
+        echo "---" >> $REPORT_FILE
+        echo "" >> $REPORT_FILE
+        
+        # Function to format REST API search results
+        format_results() {
+          local section_title="$1"
+          local query_type="$2"
+          local json_data="$3"
+          
+          echo "## $section_title" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          
+          # Count total items
+          local count=$(echo "$json_data" | jq -r '.total_count // 0')
+          echo "**Total:** $count items" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          
+          if [ "$count" -gt 0 ]; then
+            echo "| # | Title | Repository | State | Date | Link |" >> $REPORT_FILE
+            echo "|---|-------|------------|-------|------|------|" >> $REPORT_FILE
+            
+            echo "$json_data" | jq -r '.items[] | 
+              [
+                .number,
+                .title,
+                (.repository_url | split("/")[-2:] | join("/")),
+                .state,
+                ((.created_at // .updated_at) | split("T")[0]),
+                .html_url
+              ] | @tsv' | \
+            awk -F'\t' 'BEGIN{i=1} {
+              printf "| %d | %s | %s | %s | %s | [Link](%s) |\n", i++, $2, $3, $4, $5, $6
+            }' >> $REPORT_FILE
+          else
+            echo "No items found for this period." >> $REPORT_FILE
+          fi
+          
+          echo "" >> $REPORT_FILE
+        }
+        
+        # Issues created by user (across all repositories)
+        echo "📊 Fetching issues created by $USERNAME across ALL repositories on GitHub..."
+        # GitHub search query: is:issue author:username created:YYYY-MM-DD..YYYY-MM-DD
+        # This searches ALL repositories on GitHub, not just the current repo
+        ISSUES_SEARCH_QUERY="is:issue author:$USERNAME created:$FROM_DATE..$TO_DATE"
+        echo "Using global search query: $ISSUES_SEARCH_QUERY" >> reports/debug.log
+        echo "API endpoint: https://api.github.com/search/issues (searches ALL repositories)" >> reports/debug.log
+        
+        ISSUES_RESULT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/search/issues?q=$(echo "$ISSUES_SEARCH_QUERY" | sed 's/ /%20/g')&per_page=100&sort=created&order=desc")
+        
+        format_results "🐛 Issues Created" "issue" "$ISSUES_RESULT"
+        
+        # Pull requests created by user (across all repositories)
+        echo "📊 Fetching pull requests created by $USERNAME across ALL repositories on GitHub..."
+        # GitHub search query: is:pr author:username created:YYYY-MM-DD..YYYY-MM-DD
+        # This searches ALL repositories on GitHub, not just the current repo
+        PRS_SEARCH_QUERY="is:pr author:$USERNAME created:$FROM_DATE..$TO_DATE"
+        echo "Using global search query: $PRS_SEARCH_QUERY" >> reports/debug.log
+        echo "API endpoint: https://api.github.com/search/issues (searches ALL repositories)" >> reports/debug.log
+        
+        PRS_RESULT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/search/issues?q=$(echo "$PRS_SEARCH_QUERY" | sed 's/ /%20/g')&per_page=100&sort=created&order=desc")
+        
+        format_results "🔀 Pull Requests Created" "pr" "$PRS_RESULT"
+        
+        # Pull requests reviewed by user (across all repositories)
+        echo "📊 Fetching pull requests reviewed by $USERNAME across ALL repositories on GitHub..."
+        # GitHub search query: is:pr reviewed-by:username updated:YYYY-MM-DD..YYYY-MM-DD
+        # This searches ALL repositories on GitHub, not just the current repo
+        REVIEWED_SEARCH_QUERY="is:pr reviewed-by:$USERNAME updated:$FROM_DATE..$TO_DATE"
+        echo "Using global search query: $REVIEWED_SEARCH_QUERY" >> reports/debug.log
+        echo "API endpoint: https://api.github.com/search/issues (searches ALL repositories)" >> reports/debug.log
+        
+        REVIEWED_RESULT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/search/issues?q=$(echo "$REVIEWED_SEARCH_QUERY" | sed 's/ /%20/g')&per_page=100&sort=updated&order=desc")
+        
+        format_results "👀 Pull Requests Reviewed" "reviewed" "$REVIEWED_RESULT"
+        
+        # Issues assigned to user (across all repositories)
+        echo "📊 Fetching issues assigned to $USERNAME across ALL repositories on GitHub..."
+        # GitHub search query: is:issue assignee:username updated:YYYY-MM-DD..YYYY-MM-DD
+        # This searches ALL repositories on GitHub, not just the current repo
+        ASSIGNED_SEARCH_QUERY="is:issue assignee:$USERNAME updated:$FROM_DATE..$TO_DATE"
+        echo "Using global search query: $ASSIGNED_SEARCH_QUERY" >> reports/debug.log
+        echo "API endpoint: https://api.github.com/search/issues (searches ALL repositories)" >> reports/debug.log
+        
+        ASSIGNED_RESULT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/search/issues?q=$(echo "$ASSIGNED_SEARCH_QUERY" | sed 's/ /%20/g')&per_page=100&sort=updated&order=desc")
+        
+        format_results "📋 Issues Assigned" "assigned" "$ASSIGNED_RESULT"
+        
+        # Repository activity summary (using user events API)
+        echo "📊 Fetching recent activity for $USERNAME across ALL public repositories..."
+        echo "API endpoint: https://api.github.com/users/$USERNAME/events/public (global public events)" >> reports/debug.log
+        EVENTS_RESULT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/users/$USERNAME/events/public?per_page=100")
+        
+        # Filter events by date range and format
+        echo "## � Recent Activity" >> $REPORT_FILE
+        echo "" >> $REPORT_FILE
+        
+        # Count events in date range
+        ACTIVITY_COUNT=$(echo "$EVENTS_RESULT" | jq -r --arg from "$FROM_DATE" --arg to "$TO_DATE" '
+          [.[] | select(.created_at >= ($from + "T00:00:00Z") and .created_at <= ($to + "T23:59:59Z"))] | length')
+        
+        echo "**Total:** $ACTIVITY_COUNT recent activities" >> $REPORT_FILE
+        echo "" >> $REPORT_FILE
+        
+        if [ "$ACTIVITY_COUNT" -gt 0 ]; then
+          echo "| # | Activity | Repository | Date | Type |" >> $REPORT_FILE
+          echo "|---|----------|------------|------|------|" >> $REPORT_FILE
+          
+          echo "$EVENTS_RESULT" | jq -r --arg from "$FROM_DATE" --arg to "$TO_DATE" '
+            [.[] | select(.created_at >= ($from + "T00:00:00Z") and .created_at <= ($to + "T23:59:59Z"))] | 
+            sort_by(.created_at) | reverse | .[0:20] | .[] |
+            [
+              (.payload.action // .type),
+              .repo.name,
+              (.created_at | split("T")[0]),
+              .type
+            ] | @tsv' | \
+          awk -F'\t' 'BEGIN{i=1} {
+            printf "| %d | %s | %s | %s | %s |\n", i++, $1, $2, $3, $4
+          }' >> $REPORT_FILE
+        else
+          echo "No recent activities found for this period." >> $REPORT_FILE
+        fi
+        
+        echo "" >> $REPORT_FILE
+        
+        # Add summary section
+        echo "## 📈 Summary" >> $REPORT_FILE
+        echo "" >> $REPORT_FILE
+        
+        # Calculate totals
+        ISSUES_COUNT=$(echo "$ISSUES_RESULT" | jq -r '.total_count // 0')
+        PRS_COUNT=$(echo "$PRS_RESULT" | jq -r '.total_count // 0')
+        REVIEWED_COUNT=$(echo "$REVIEWED_RESULT" | jq -r '.total_count // 0')
+        ASSIGNED_COUNT=$(echo "$ASSIGNED_RESULT" | jq -r '.total_count // 0')
+        TOTAL_ACTIVITY=$((ISSUES_COUNT + PRS_COUNT + REVIEWED_COUNT + ASSIGNED_COUNT + ACTIVITY_COUNT))
+        
+        echo "| Activity Type | Count |" >> $REPORT_FILE
+        echo "|---------------|-------|" >> $REPORT_FILE
+        echo "| Issues Created | $ISSUES_COUNT |" >> $REPORT_FILE
+        echo "| Pull Requests Created | $PRS_COUNT |" >> $REPORT_FILE
+        echo "| Pull Requests Reviewed | $REVIEWED_COUNT |" >> $REPORT_FILE
+        echo "| Issues Assigned | $ASSIGNED_COUNT |" >> $REPORT_FILE
+        echo "| Recent Activities | $ACTIVITY_COUNT |" >> $REPORT_FILE
+        echo "| **Total Activity** | **$TOTAL_ACTIVITY** |" >> $REPORT_FILE
+        echo "" >> $REPORT_FILE
+        
+        echo "---" >> $REPORT_FILE
+        echo "*Report generated by GitHub Actions*" >> $REPORT_FILE
+        
+        echo "✅ Report generated: $REPORT_FILE"
+        echo "REPORT_FILE=$REPORT_FILE" >> $GITHUB_ENV
+
+    - name: Upload Activity Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: github-activity-report-${{ env.FROM_DATE }}-to-${{ env.TO_DATE }}
+        path: reports/
+        retention-days: 90
+
+    - name: Display Report Summary
+      run: |
+        echo "🎉 Activity report generated successfully!"
+        echo ""
+        echo "📁 Report saved to: $REPORT_FILE"
+        echo "📊 Report covers period: $FROM_DATE to $TO_DATE"
+        echo "👤 User analyzed: $USERNAME"
+        echo ""
+        echo "📋 Quick Summary:"
+        tail -n 10 $REPORT_FILE
